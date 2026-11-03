@@ -1,0 +1,84 @@
+name: Build Sing-box Lite for Cudy WR3000S v1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux arm64 static binary and OpenWrt IPK
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.23.12'
+
+      - name: Get pinned upstream source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v1.12.25 https://github.com/SagerNet/sing-box.git source
+          test -f source/go.mod
+
+      - name: Build only VLESS/Reality-relevant optional features
+        shell: bash
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd source
+          go build -trimpath -tags 'with_utls' \
+            -ldflags '-s -w -buildid= -X github.com/sagernet/sing-box/constant.Version=1.12.25' \
+            -o ../dist/sing-box ./cmd/sing-box
+          cd ..
+          file dist/sing-box
+          test "$(file -b dist/sing-box | grep -c 'ARM aarch64')" -ge 1
+          printf '\nEXTRACTED_BINARY_BYTES='; wc -c < dist/sing-box
+          sha256sum dist/sing-box > dist/sing-box.sha256
+
+      - name: Make native opkg package for ImmortalWrt 24.10.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG='sing-box_1.12.25-r99_aarch64_cortex-a53.ipk'
+          mkdir -p package/control package/root/usr/bin
+          install -m 0755 dist/sing-box package/root/usr/bin/sing-box
+          cat > package/control/control <<'EOF'
+          Package: sing-box
+          Version: 1.12.25-r99
+          Architecture: aarch64_cortex-a53
+          Maintainer: Local custom build
+          Section: net
+          Priority: optional
+          Depends: libc
+          Description: Compact Sing-box, static arm64, with uTLS for VLESS Reality, no QUIC or WireGuard
+          EOF
+          printf '2.0\n' > package/debian-binary
+          tar -czf package/control.tar.gz -C package/control .
+          tar -czf package/data.tar.gz -C package/root .
+          tar -czf "dist/$PKG" -C package ./debian-binary ./data.tar.gz ./control.tar.gz
+          echo '=== IPK contents ==='
+          tar -tzf "dist/$PKG"
+          echo '=== Compressed package size ==='
+          du -h "dist/$PKG"
+          echo '=== Binary size after installation (without extra dependencies) ==='
+          du -h dist/sing-box
+          sha256sum "dist/$PKG" > dist/IPK-SHA256SUMS
+
+      - name: Publish downloadable build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudy-wr3000s-singbox-lite-1.12.25
+          path: |
+            dist/*.ipk
+            dist/IPK-SHA256SUMS
+            dist/sing-box.sha256
+          if-no-files-found: error
+          retention-days: 14
