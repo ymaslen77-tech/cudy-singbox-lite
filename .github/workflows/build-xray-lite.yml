@@ -1,0 +1,134 @@
+name: Build Xray Lite for Cudy WR3000S v1
+
+on:
+  push:
+    paths:
+      - .github/workflows/build-xray-lite.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and self-test Xray 26.10.31 arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 35
+    steps:
+      - name: Fetch fixed official Xray source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v26.10.31 https://github.com/XTLS/Xray-core.git source
+          test "$(git -C source rev-parse --short=7 HEAD)" = "a4a3dff"
+          grep -qx 'go 1.27' source/go.mod
+
+      - name: Install source-required Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: source/go.mod
+          cache: false
+
+      - name: Build native arm64 without cgo and debug symbols
+        shell: bash
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm64
+          GOARM64: v8.0
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ( cd source && go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o ../dist/xray ./main )
+          file dist/xray
+          file dist/xray | grep -Eq 'aarch64|ARM64'
+          if readelf -l dist/xray | grep -q 'INTERP'; then
+            echo 'ERROR: binary is dynamically linked'
+            exit 1
+          fi
+          dist/xray version
+          sha256sum dist/xray > dist/xray.sha256
+          SIZE="$(stat -c%s dist/xray)"
+          echo "Uncompressed binary bytes: $SIZE"
+          echo "Binary size: $SIZE bytes" >> "$GITHUB_STEP_SUMMARY"
+          # Reserve about 7 MiB of a 37 MiB overlay for config and LuCI.
+          if [ "$SIZE" -gt 31457280 ]; then
+            echo "ERROR: size exceeds 30 MiB gate; do not install on router."
+            exit 1
+          fi
+
+      - name: Offline Xray configuration and localhost SOCKS test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > dist/local-socks.json <<'JSON'
+          {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{"listen": "127.0.0.1", "port": 10879, "protocol": "socks",
+              "settings": {"auth": "noauth", "udp": false}}],
+            "outbounds": [{"protocol": "freedom", "tag": "direct"}]
+          }
+          JSON
+          dist/xray run -test -config dist/local-socks.json
+          python3 -m http.server 18080 --bind 127.0.0.1 > dist/http-test.log 2>&1 &
+          HTTP_PID=$!
+          dist/xray run -config dist/local-socks.json > dist/xray-test.log 2>&1 &
+          XRAY_PID=$!
+          trap 'kill "$HTTP_PID" "$XRAY_PID" 2>/dev/null || true' EXIT
+          sleep 3
+          curl --fail --silent --show-error --max-time 10 --socks5-hostname 127.0.0.1:10879 http://127.0.0.1:18080/ > /dev/null
+          echo 'PASS: localhost HTTP via Xray SOCKS inbound and direct outbound'
+          PUBKEY="$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+          cat > dist/reality-parse.json <<JSON
+          {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{"listen": "127.0.0.1", "port": 10880, "protocol": "socks",
+              "settings": {"auth": "noauth", "udp": false}}],
+            "outbounds": [{"protocol": "vless",
+              "settings": {"vnext": [{"address": "203.0.113.1", "port": 443,
+                "users": [{"id": "11111111-1111-4111-8111-111111111111", "encryption": "none"}]}]},
+              "streamSettings": {"network": "tcp", "security": "reality",
+                "realitySettings": {"serverName": "example.org", "fingerprint": "firefox",
+                  "publicKey": "$PUBKEY", "shortId": "74a9384bf3", "spiderX": "/"}}}]
+          }
+          JSON
+          dist/xray run -test -config dist/reality-parse.json
+          echo 'PASS: VLESS/REALITY configuration parsed with firefox fingerprint'
+          echo 'Tests validate parser and localhost SOCKS; live Pechatniki handshake remains to be tested on router.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Make opkg IPK, no GeoIP or GeoSite bundled
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG='xray-core_26.10.31-r99_aarch64_cortex-a53.ipk'
+          mkdir -p pkg/control pkg/root/usr/bin
+          install -m 0755 dist/xray pkg/root/usr/bin/xray
+          cat > pkg/control/control <<'EOF'
+          Package: xray-core
+          Version: 26.10.31-r99
+          Architecture: aarch64_cortex-a53
+          Maintainer: Local reproducible build from XTLS/Xray-core tag v26.10.31
+          Section: net
+          Priority: optional
+          Depends: libc
+          Description: Xray 26.10.31 static ARM64 without GeoIP or GeoSite assets
+          EOF
+          printf '2.0\n' > pkg/debian-binary
+          tar -czf pkg/control.tar.gz -C pkg/control .
+          tar -czf pkg/data.tar.gz -C pkg/root .
+          tar -czf "dist/$PKG" -C pkg ./debian-binary ./control.tar.gz ./data.tar.gz
+          tar -tzf "dist/$PKG"
+          sha256sum "dist/$PKG" > dist/IPK-SHA256SUMS
+          echo "Package: $PKG" >> "$GITHUB_STEP_SUMMARY"
+          du -h "dist/$PKG" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish only tested package and hashes
+        uses: actions/upload-artifact@v4
+        with:
+          name: cudy-wr3000s-xray-lite-26.10.31
+          path: |
+            dist/*.ipk
+            dist/IPK-SHA256SUMS
+            dist/xray.sha256
+          if-no-files-found: error
+          retention-days: 30
